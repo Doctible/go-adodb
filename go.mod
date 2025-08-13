@@ -1,4 +1,4 @@
-module github.com/mattn/go-adodb
+module github.com/Doctible/go-adodb
 
 go 1.14
 
