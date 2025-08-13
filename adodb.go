@@ -177,55 +177,99 @@ func (c *AdodbConn) Prepare(query string) (driver.Stmt, error) {
 }
 
 func (c *AdodbConn) prepare(ctx context.Context, query string) (driver.Stmt, error) {
+	var s *ole.IDispatch
+	var ps *ole.IDispatch
+
 	unknown, err := oleutil.CreateObject("ADODB.Command")
 	if err != nil {
 		return nil, err
 	}
-	s, err := unknown.QueryInterface(ole.IID_IDispatch)
-	unknown.Release()
+	// unknown is released immediately after use, standard pattern.
+	s, err = unknown.QueryInterface(ole.IID_IDispatch)
+	unknown.Release() // Release the IUnknown of ADODB.Command, s now holds the IDispatch reference.
 	if err != nil {
 		return nil, err
 	}
-	rv, err := oleutil.PutProperty(s, "ActiveConnection", c.db)
+	// Defer release of s. Will be cancelled if successfully returned by setting s = nil.
+	defer func() {
+		if s != nil {
+			fullRelease(s)
+		}
+	}()
+
+	var rv *ole.VARIANT
+	rv, err = oleutil.PutProperty(s, "ActiveConnection", c.db)
 	if err != nil {
-		return nil, err
+		return nil, err // s will be released by defer
 	}
 	rv.Clear()
+
 	rv, err = oleutil.PutProperty(s, "CommandText", query)
 	if err != nil {
-		return nil, err
+		return nil, err // s will be released by defer
 	}
 	rv.Clear()
+
 	rv, err = oleutil.PutProperty(s, "CommandType", 1)
 	if err != nil {
-		return nil, err
+		return nil, err // s will be released by defer
 	}
 	rv.Clear()
+
 	rv, err = oleutil.PutProperty(s, "Prepared", true)
 	if err != nil {
-		return nil, err
+		return nil, err // s will be released by defer
 	}
 	rv.Clear()
-	val, err := oleutil.GetProperty(s, "Parameters")
+
+	var valParameters *ole.VARIANT
+	valParameters, err = oleutil.GetProperty(s, "Parameters")
 	if err != nil {
-		return nil, err
+		return nil, err // s will be released by defer
 	}
-	ps := val.ToIDispatch()
-	val.Clear()
+	ps = valParameters.ToIDispatch()
+	valParameters.Clear() // Clear the variant that held ps
+	// Defer release of ps. Will be cancelled if successfully returned by setting ps = nil.
+	defer func() {
+		if ps != nil {
+			fullRelease(ps)
+		}
+	}()
 
 	pc := -1
 	rv, err = oleutil.GetProperty(ps, "Count")
 	if err != nil {
-		rv, err = oleutil.CallMethod(ps, "Refresh")
-		if err == nil {
-			rv.Clear()
+		// Attempt to Refresh parameters if Count failed (e.g., for stored procedures without explicit params)
+		rvRefresh, refreshErr := oleutil.CallMethod(ps, "Refresh")
+		if refreshErr != nil {
+			// Refresh also failed. Return the original error from GetProperty(ps, "Count")
+			// s and ps will be released by defers
+			return err
 		}
+		rvRefresh.Clear()
+		// After refresh, try getting count again
+		rvCountAfterRefresh, countErr := oleutil.GetProperty(ps, "Count")
+		if countErr != nil {
+			// Still can't get count. Return the error from the second GetProperty attempt.
+			// s and ps will be released by defers
+			return countErr
+		}
+		pc = int(rvCountAfterRefresh.Val)
+		rvCountAfterRefresh.Clear()
 	} else {
 		pc = int(rv.Val)
 		rv.Clear()
 	}
 
-	return &AdodbStmt{c: c, s: s, ps: ps, pc: pc}, nil
+	// If we reach here, all operations were successful.
+	// Prepare the statement.
+	stmt := &AdodbStmt{c: c, s: s, ps: ps, pc: pc}
+
+	// Cancel the deferred releases by nilling out the pointers.
+	s = nil
+	ps = nil
+
+	return stmt, nil
 }
 
 func (s *AdodbStmt) Close() error {
@@ -308,7 +352,7 @@ func (s *AdodbStmt) query(ctx context.Context, args []namedValue) (driver.Rows, 
 		return nil, err
 	}
 	rc := res.ToIDispatch()
-	rc.AddRef()
+	// rc.AddRef() // Removed: ToIDispatch already AddRefs
 	res.Clear()
 	return &AdodbRows{s: s, rc: rc, nc: -1, cols: nil}, nil
 }
@@ -481,15 +525,26 @@ func (rc *AdodbRows) Next(dest []driver.Value) error {
 		case 8: // ADBSTR
 			dest[i] = val.ToString()
 		case 9: // ADIDISPATCH
-			dest[i] = val.ToIDispatch()
+			// Returning raw COM pointers is a leak risk as database/sql doesn't manage their lifecycle.
+			// Release the AddRef'd pointer obtained by ToIDispatch and return nil.
+			if disp := val.ToIDispatch(); disp != nil {
+				disp.Release()
+			}
+			dest[i] = nil
 		case 10: // ADERROR
 			// TODO
+			dest[i] = nil // Placeholder for unhandled type
 		case 11: // ADBOOLEAN
 			dest[i] = val.Val != 0
 		case 12: // ADVARIANT
-			dest[i] = val
+			dest[i] = val // Transferring ownership of the VARIANT itself
 		case 13: // ADIUNKNOWN
-			dest[i] = val.ToIUnknown()
+			// Returning raw COM pointers is a leak risk.
+			// Release the AddRef'd pointer obtained by ToIUnknown and return nil.
+			if unk := val.ToIUnknown(); unk != nil {
+				unk.Release()
+			}
+			dest[i] = nil
 		case 14: // ADDECIMAL
 			sub := math.Pow(10, float64(sc.Val))
 			dest[i] = float64(float64(val.Val) / sub)
@@ -509,13 +564,58 @@ func (rc *AdodbRows) Next(dest []driver.Value) error {
 		case 72: // ADGUID
 			dest[i] = val.ToString()
 		case 128: // ADBINARY
-			sa := (*ole.SafeArray)(unsafe.Pointer(uintptr(val.Val)))
-			conv := &ole.SafeArrayConversion{sa}
-			elems, err := conv.TotalElements(0)
-			if err != nil {
-				return err
+			if val.VT == (ole.VT_ARRAY | ole.VT_UI1) {
+				sa := val.ToArray().ToSafeArray()
+				// Lock the SafeArray to access its data
+				if err := ole.SafeArrayAccessData(sa); err != nil {
+					// Ensure dependent variants are cleared before returning
+					typ.Clear()
+					sc.Clear()
+					val.Clear() // This will attempt to destroy the problematic safearray if not handled
+					field.Release()
+					return err
+				}
+				// Defer unaccessing data, must happen before val.Clear() potentially destroys sa
+				defer ole.SafeArrayUnaccessData(sa)
+
+				var lLbound, lUbound int32
+				// Assuming 1-dimensional array for byte data
+				if err := ole.SafeArrayGetLBound(sa, 1, &lLbound); err != nil {
+					typ.Clear()
+					sc.Clear()
+					// val.Clear() might be problematic if sa is in a bad state, but attempt cleanup
+					// ole.SafeArrayUnaccessData(sa) // already deferred
+					field.Release()
+					return err
+				}
+				if err := ole.SafeArrayGetUBound(sa, 1, &lUbound); err != nil {
+					typ.Clear()
+					sc.Clear()
+					// val.Clear()
+					field.Release()
+					return err
+				}
+				
+				numElements := lUbound - lLbound + 1
+				if numElements < 0 { // Should not happen with valid LBound/UBound
+					numElements = 0
+				}
+
+				if numElements == 0 {
+					dest[i] = []byte{}
+				} else {
+					goSlice := make([]byte, numElements)
+					// sa.Data is a void*, cast to byte*
+					srcPtr := unsafe.Pointer(sa.Data)
+					for j := int32(0); j < numElements; j++ {
+						goSlice[j] = *(*byte)(unsafe.Pointer(uintptr(srcPtr) + uintptr(j)))
+					}
+					dest[i] = goSlice
+				}
+			} else {
+				// Data is not VT_ARRAY|VT_UI1, treat as null or error
+				dest[i] = nil
 			}
-			dest[i] = (*[1 << 30]byte)(unsafe.Pointer(uintptr(sa.Data)))[0:elems]
 		case 129: // ADCHAR
 			dest[i] = val.ToString() //uint8(val.Val)
 		case 130: // ADWCHAR
@@ -549,16 +649,82 @@ func (rc *AdodbRows) Next(dest []driver.Value) error {
 		case 203: // ADLONGVARWCHAR
 			dest[i] = val.ToString()
 		case 204: // ADVARBINARY
-			// TODO
-		case 205: // ADLONGVARBINARY
-			sa := (*ole.SafeArray)(unsafe.Pointer(uintptr(val.Val)))
-			conv := &ole.SafeArrayConversion{sa}
-			elems, err := conv.TotalElements(0)
-			if err != nil {
-				return err
+			// Assuming ADVARBINARY is also VT_ARRAY | VT_UI1 like ADBINARY
+			if val.VT == (ole.VT_ARRAY | ole.VT_UI1) {
+				sa := val.ToArray().ToSafeArray()
+				if err := ole.SafeArrayAccessData(sa); err != nil {
+					// Error accessing data; rely on outer loop cleanup for field, typ, sc, val.
+					// field.Release(), typ.Clear(), sc.Clear(), val.Clear() will be called eventually by the loop structure.
+					return err
+				}
+				// Unaccess must happen before val.Clear() is called for this val.
+				defer ole.SafeArrayUnaccessData(sa)
+
+				var lLbound, lUbound int32
+				// Assuming 1-dimensional array for byte data
+				if err := ole.SafeArrayGetLBound(sa, 1, &lLbound); err != nil {
+					return err // Defer will call UnaccessData.
+				}
+				if err := ole.SafeArrayGetUBound(sa, 1, &lUbound); err != nil {
+					return err // Defer will call UnaccessData.
+				}
+				
+				numElements := lUbound - lLbound + 1
+				if numElements < 0 { numElements = 0 }
+
+				if numElements == 0 {
+					dest[i] = []byte{}
+				} else {
+					goSlice := make([]byte, numElements)
+					srcPtr := unsafe.Pointer(sa.Data) // Data pointer is valid after SafeArrayAccessData
+					for j := int32(0); j < numElements; j++ {
+						goSlice[j] = *(*byte)(unsafe.Pointer(uintptr(srcPtr) + uintptr(j)))
+					}
+					dest[i] = goSlice
+				}
+			} else {
+				// Not a VT_ARRAY|VT_UI1, so not the expected byte array. Return nil.
+				dest[i] = nil
 			}
-			dest[i] = (*[1 << 30]byte)(unsafe.Pointer(uintptr(sa.Data)))[0:elems]
+		case 205: // ADLONGVARBINARY
+			// Assuming ADLONGVARBINARY is also VT_ARRAY | VT_UI1 like ADBINARY
+			if val.VT == (ole.VT_ARRAY | ole.VT_UI1) {
+				sa := val.ToArray().ToSafeArray()
+				if err := ole.SafeArrayAccessData(sa); err != nil {
+					return err
+				}
+				defer ole.SafeArrayUnaccessData(sa)
+
+				var lLbound, lUbound int32
+				if err := ole.SafeArrayGetLBound(sa, 1, &lLbound); err != nil {
+					return err
+				}
+				if err := ole.SafeArrayGetUBound(sa, 1, &lUbound); err != nil {
+					return err
+				}
+
+				numElements := lUbound - lLbound + 1
+				if numElements < 0 { numElements = 0 }
+				
+				if numElements == 0 {
+					dest[i] = []byte{}
+				} else {
+					goSlice := make([]byte, numElements)
+					srcPtr := unsafe.Pointer(sa.Data)
+					for j := int32(0); j < numElements; j++ {
+						goSlice[j] = *(*byte)(unsafe.Pointer(uintptr(srcPtr) + uintptr(j)))
+					}
+					dest[i] = goSlice
+				}
+			} else {
+				dest[i] = nil
+			}
 		}
+		// If typ.Val is ADVARIANT (12), 'val' itself is assigned to dest[i],
+		// and ownership of 'val' (including responsibility for Clear'ing it)
+		// is transferred to the caller/receiver.
+		// For all other types, 'val' is a temporary VARIANT whose content is
+		// copied or converted, so it must be cleared here to free its resources.
 		if typ.Val != 12 {
 			val.Clear()
 		}
