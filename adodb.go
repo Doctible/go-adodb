@@ -32,6 +32,18 @@ func fullRelease(obj releaser) {
 	}
 }
 
+func safeArrayBytes(val *ole.VARIANT) ([]byte, error) {
+	sa := (*ole.SafeArray)(unsafe.Pointer(uintptr(val.Val)))
+	conv := &ole.SafeArrayConversion{sa}
+	elems, err := conv.TotalElements(0)
+	if err != nil {
+		return nil, err
+	}
+	buf := make([]byte, elems)
+	copy(buf, (*[1<<30]byte)(unsafe.Pointer(uintptr(sa.Data)))[:elems:elems])
+	return buf, nil
+}
+
 func init() {
 	sql.Register("adodb", &AdodbDriver{})
 }
@@ -509,13 +521,11 @@ func (rc *AdodbRows) Next(dest []driver.Value) error {
 		case 72: // ADGUID
 			dest[i] = val.ToString()
 		case 128: // ADBINARY
-			sa := (*ole.SafeArray)(unsafe.Pointer(uintptr(val.Val)))
-			conv := &ole.SafeArrayConversion{sa}
-			elems, err := conv.TotalElements(0)
+			buf, err := safeArrayBytes(val)
 			if err != nil {
 				return err
 			}
-			dest[i] = (*[1 << 30]byte)(unsafe.Pointer(uintptr(sa.Data)))[0:elems]
+			dest[i] = buf
 		case 129: // ADCHAR
 			dest[i] = val.ToString() //uint8(val.Val)
 		case 130: // ADWCHAR
@@ -551,13 +561,11 @@ func (rc *AdodbRows) Next(dest []driver.Value) error {
 		case 204: // ADVARBINARY
 			// TODO
 		case 205: // ADLONGVARBINARY
-			sa := (*ole.SafeArray)(unsafe.Pointer(uintptr(val.Val)))
-			conv := &ole.SafeArrayConversion{sa}
-			elems, err := conv.TotalElements(0)
+			buf, err := safeArrayBytes(val)
 			if err != nil {
 				return err
 			}
-			dest[i] = (*[1 << 30]byte)(unsafe.Pointer(uintptr(sa.Data)))[0:elems]
+			dest[i] = buf
 		}
 		if typ.Val != 12 {
 			val.Clear()
@@ -822,11 +830,11 @@ func (rc *AdodbRows) ColumnTypeScanType(i int) reflect.Type {
 		var gi ole.GUID
 		rt = reflect.TypeOf(gi)
 	case 128: // ADBINARY
-		rt = reflect.TypeOf((*ole.SafeArray)(nil))
+		rt = reflect.TypeOf([]byte{})
 	case 129: // ADCHAR
-		rt = reflect.TypeOf(byte(0))
+		rt = reflect.TypeOf("")
 	case 130: // ADWCHAR
-		rt = reflect.TypeOf(rune(0))
+		rt = reflect.TypeOf("")
 	case 131: // ADNUMERIC
 		rt = reflect.TypeOf(float64(0))
 	case 132: // ADUSERDEFINED
@@ -850,7 +858,7 @@ func (rc *AdodbRows) ColumnTypeScanType(i int) reflect.Type {
 	case 204: // ADVARBINARY
 		rt = reflect.TypeOf([]byte{})
 	case 205: // ADLONGVARBINARY
-		rt = reflect.TypeOf((*ole.SafeArray)(nil))
+		rt = reflect.TypeOf([]byte{})
 	}
 	typ.Clear()
 	item.Release()
